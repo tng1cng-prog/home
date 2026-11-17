@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ErrNo / ErrSubIdx 提取工具</title>
+<script>
+window.__xlsxReady = new Promise(function (resolve) {
+  var urls = [
+    "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
+  ];
+  var i = 0;
+  (function loadNext() {
+    if (window.XLSX) return resolve(true);
+    if (i >= urls.length) return resolve(false);
+    var s = document.createElement("script");
+    s.src = urls[i++];
+    s.onload = function () { resolve(true); };
+    s.onerror = loadNext;
+    document.head.appendChild(s);
+  })();
+});
+</script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f7fb; color: #172033; padding: 32px 20px;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 6px; }
+  .sub { color: #667085; margin: 0 0 24px; line-height: 1.7; }
+  .card {
+    background: #fff; border: 1px solid #e4e7ec; border-radius: 14px;
+    padding: 22px; margin-bottom: 18px;
+  }
+  .row { margin: 14px 0; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { font-size: 13px; color: #667085; margin-top: 5px; line-height: 1.5; }
+  input[type="file"] {
+    width: 100%; padding: 10px 12px; border: 1px solid #cfd5df;
+    border-radius: 10px; background: #fff; font-size: 14px;
+  }
+  button {
+    border: 0; border-radius: 10px; padding: 11px 22px; font-weight: 700;
+    cursor: pointer; font-size: 14px; background: #2563eb; color: #fff;
+  }
+  button:hover { background: #1d4ed8; }
+  button.ghost { background: #eef2ff; color: #1e3a8a; }
+  button.ghost:hover { background: #dbeafe; }
+  .status {
+    border-radius: 10px; border: 1px solid #e4e7ec; background: #f9fafb;
+    padding: 12px 14px; color: #667085; line-height: 1.7;
+    white-space: pre-wrap; margin-top: 16px; min-height: 48px;
+  }
+  .status.ok { border-color: #a7f3d0; background: #ecfdf5; color: #047857; }
+  .status.err { border-color: #fecaca; background: #fef2f2; color: #b42318; }
+  .preview-wrap {
+    margin-top: 16px; overflow: auto; border: 1px solid #e4e7ec;
+    border-radius: 10px; max-height: 400px; background: #fff; display: none;
+  }
+  table { border-collapse: collapse; width: 100%; min-width: 520px; }
+  th, td { border-bottom: 1px solid #eef0f4; padding: 8px 10px; text-align: left; font-size: 13px; }
+  th { background: #f3f6fb; position: sticky; top: 0; }
+  code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <h1>ErrNo / ErrSubIdx 提取工具</h1>
+  <p class="sub">
+    上传报警表（含 <code>ID</code>、<code>Alarm text</code>、<code>FieldInfo</code>、<code>Class</code>）和
+    文本列表（含 <code>Parent</code>、<code>Value</code>、<code>Text [zh-CN]</code>）两份 Excel，
+    生成 <code>ErrorNoSubIndex</code> / <code>ErrorText</code> / <code>Class</code> / <code>SubIndex</code> 四列结果。
+    编号直接连写：ID=35、Value=1 → <code>351</code>；Value 为 0 时只输出 ID（如 <code>35</code>），文本为 Alarm text 前段拼接固定文本“错误”。Class 映射：Alarm=1、WarningClass=2、Notification=3。
+    <code>SubIndex</code> 列记录拼接用的子索引值：有值表示该行是拼接生成的，空表示纯 ID 未拼接。
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <label>报警表 Excel（ErrNo 对应文本）</label>
+      <input id="alarmFile" type="file" accept=".xlsx,.xls" />
+      <div class="hint">自动寻找含 ID / Alarm text 列的工作表（优先 DiscreteAlarms）。</div>
+    </div>
+    <div class="row">
+      <label>文本列表 Excel（ErrSubIdx）</label>
+      <input id="textListFile" type="file" accept=".xlsx,.xls" />
+      <div class="hint">自动寻找含 Parent / Value / Text 列的工作表（优先 TextListEntry）。</div>
+    </div>
+    <button id="runBtn">提取并下载 Excel</button>
+    <button id="previewBtn" class="ghost">仅预览</button>
+    <div id="status" class="status">请先上传两份 Excel。</div>
+    <div id="preview" class="preview-wrap"></div>
+  </div>
+</main>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+
+  function setStatus(msg, type) {
+    const el = $("status");
+    el.className = "status" + (type ? " " + type : "");
+    el.textContent = msg;
+  }
+
+  async function ensureXlsx() {
+    if (typeof XLSX !== "undefined") return true;
+    return !!(window.__xlsxReady && await window.__xlsxReady && typeof XLSX !== "undefined");
+  }
+
+  /* ---------- 基础工具 ---------- */
+
+  function clean(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "number") return Number.isInteger(value) ? String(value) : String(value).replace(/\.0+$/, "");
+    return String(value).replace(/\r?\n/g, "\n").trim();
+  }
+
+  function canonical(value) {
+    let s = clean(value);
+    if (s.normalize) s = s.normalize("NFKC");
+    return s.toLowerCase().replace(/\u00a0/g, " ").replace(/[\s_\-–—.,，:：;；\[\]()（）<>【】{}'"`/\\|]+/g, "");
+  }
+
+  function isNoValue(value) {
+    const v = clean(value);
+    return !v || /^<no\s*value>$/i.test(v);
+  }
+
+  function isZeroValue(value) {
+    return /^0+(?:\.0+)?$/.test(clean(value));
+  }
+
+  function mapClass(value) {
+    const v = canonical(value);
+    if (v === "alarm") return "1";
+    if (v === "warningclass" || v === "warning") return "2";
+    if (v === "notification" || v === "info") return "3";
+    return "";
+  }
+
+  /* ---------- 表头识别 ---------- */
+
+  const ERR_COLS = [
+    { key: "id",      match: (h) => h === "id" },
+    { key: "alarm",  match: (h) => h.includes("alarm") && h.includes("text") },
+    { key: "field",   match: (h) => h.includes("fieldinfo") },
+    { key: "class",   match: (h) => h === "class" }
+  ];
+  const SUB_COLS = [
+    { key: "parent", match: (h) => h === "parent" },
+    { key: "value",  match: (h) => h === "value" },
+    { key: "text",   match: (h) => h.includes("text") }
+  ];
+
+  function sheetRows(workbook, name) {
+    return XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: "", raw: false, blankrows: false });
+  }
+
+  function findHeader(rows, cols) {
+    const required = cols.filter(c => c.key !== "field" && c.key !== "class");
+    let best = null;
+    for (let r = 0; r < Math.min(rows.length, 120); r++) {
+      const normalized = (rows[r] || []).map(canonical);
+      const index = {};
+      let matched = 0;
+      for (const col of cols) {
+        index[col.key] = normalized.findIndex(col.match);
+        if (index[col.key] >= 0) matched++;
+      }
+      const reqOk = required.every(col => index[col.key] >= 0);
+      if (!best || matched > best.matched) best = { rowIndex: r, index, matched, headers: rows[r] || [] };
+      if (reqOk && matched === cols.length) return best;
+    }
+    if (best && required.every(col => best.index[col.key] >= 0)) return best;
+    return null;
+  }
+
+  function pickSheet(workbook, cols, preferred, name) {
+    if (preferred && workbook.SheetNames.includes(preferred)) {
+      const rows = sheetRows(workbook, preferred);
+      const header = findHeader(rows, cols);
+      if (header) return { sheetName: preferred, rows, header };
+    }
+    for (const sheetName of workbook.SheetNames) {
+      const rows = sheetRows(workbook, sheetName);
+      const header = findHeader(rows, cols);
+      if (header) return { sheetName, rows, header };
+    }
+    throw new Error(name + "：未找到包含必需表头（" + cols.map(c => c.key).join("、") + "）的工作表");
+  }
+
+  /* ---------- FieldInfo / ref 解析 ---------- */
+
+  function parseRefs(fieldInfo) {
+    const refs = [];
+    const blockRe = /<\s*ref\b([^>]*)>/gi;
+    let m;
+    while ((m = blockRe.exec(clean(fieldInfo))) !== null) {
+      const body = m[1] || "";
+      const id = /id\s*=\s*([^;>]+)/i.exec(body);
+      const tl = /TextList\s*=\s*([^;>]+)/i.exec(body);
+      refs.push({
+        id: id ? clean(id[1]) : "",
+        textList: tl ? clean(tl[1]) : ""
+      });
+    }
+    return refs;
+  }
+
+  function isErrorTextList(name) {
+    return /(error|err|alarm)/i.test(clean(name));
+  }
+
+  function placeholderRegex(refId) {
+    const escaped = String(refId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("<\\s*field\\s+ref\\s*=\\s*['\"]" + escaped + "['\"]\\s*/?\\s*>", "gi");
+  }
+
+  function stripPlaceholders(text) {
+    return clean(text).replace(/<\s*field\s+ref\s*=\s*['"][^'"]+['"]\s*\/?\s*>/gi, "");
+  }
+
+  function cleanupText(text) {
+    return clean(text)
+      .replace(/\s+([,，;；:：.。])/g, "$1")
+      .replace(/\s*[-–—:：]\s*$/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
+  /* ---------- 核心提取 ---------- */
+
+  function extract(errWb, subWb) {
+    const errPick = pickSheet(errWb, ERR_COLS, "DiscreteAlarms", "报警表");
+    const subPick = pickSheet(subWb, SUB_COLS, "TextListEntry", "文本列表");
+    const idCol = errPick.header.index.id;
+    const alarmCol = errPick.header.index.alarm;
+    const fieldCol = errPick.header.index.field;
+    const classCol = errPick.header.index.class;
+    const parentCol = subPick.header.index.parent;
+    const valueCol = subPick.header.index.value;
+    const textCol = subPick.header.index.text;
+
+    // TextList 查找表：Parent -> [{value, text}]
+    const lookup = new Map();
+    for (let r = subPick.header.rowIndex + 1; r < subPick.rows.length; r++) {
+      const row = subPick.rows[r] || [];
+      const parent = clean(row[parentCol]);
+      const value = clean(row[valueCol]);
+      if (!parent || !value) continue;
+      const key = canonical(parent);
+      if (!lookup.has(key)) lookup.set(key, []);
+      lookup.get(key).push({ value, text: clean(row[textCol]) });
+    }
+
+    const out = [["ErrorNoSubIndex", "ErrorText", "Class", "SubIndex"]];
+    const stats = { plain: 0, expanded: 0, zero: 0, skipped: 0, fallback: 0 };
+
+    for (let r = errPick.header.rowIndex + 1; r < errPick.rows.length; r++) {
+      const row = errPick.rows[r] || [];
+      const bit = clean(row[idCol]);
+      if (!bit || !row.some(clean)) continue;
+      const alarmText = clean(row[alarmCol]);
+      const fieldInfo = fieldCol >= 0 ? clean(row[fieldCol]) : "";
+      const classValue = classCol >= 0 ? mapClass(row[classCol]) : "";
+
+      // 普通报警：无 FieldInfo 或 FieldInfo 无 ref
+      const refs = parseRefs(fieldInfo);
+      if (!fieldInfo || isNoValue(fieldInfo) || /^\d+$/.test(fieldInfo) || !refs.length) {
+        if (isNoValue(alarmText)) { stats.skipped++; continue; }
+        out.push([bit, alarmText, classValue, ""]);
+        stats.plain++;
+        continue;
+      }
+
+      // 只展开 Error 类 TextList
+      const errRefs = refs.filter(ref => isErrorTextList(ref.textList));
+      if (!errRefs.length) {
+        if (!isNoValue(alarmText)) {
+          out.push([bit, cleanupText(stripPlaceholders(alarmText)) || alarmText, classValue, ""]);
+          stats.fallback++;
+        }
+        continue;
+      }
+
+      let expanded = false;
+      for (const ref of errRefs) {
+        const entries = lookup.get(canonical(ref.textList));
+        if (!entries || !entries.length) continue;
+        for (const entry of entries) {
+          const zero = isZeroValue(entry.value);
+          if (!zero && isNoValue(entry.text)) { stats.skipped++; continue; }
+
+          let key, info, subIdx;
+          if (zero) {
+            // 子索引为 0：只输出前段 ID，文本为 Alarm text 前段 + 固定文本“错误”
+            key = bit;
+            info = cleanupText(stripPlaceholders(alarmText)) + "错误";
+            subIdx = "0";
+            stats.zero++;
+          } else {
+            key = bit + entry.value;
+            subIdx = entry.value;
+            // 把 SubIdx 文本回填到对应占位符；找不到占位符则追加
+            info = alarmText;
+            if (ref.id !== "") {
+              const replaced = info.replace(placeholderRegex(ref.id), clean(entry.text));
+              if (replaced === info && info) info = info + clean(entry.text);
+              else info = replaced;
+            } else if (info) {
+              info = info + clean(entry.text);
+            } else {
+              info = clean(entry.text);
+            }
+            // 清理其他未展开的占位符
+            info = cleanupText(stripPlaceholders(info)) || info;
+            stats.expanded++;
+          }
+          out.push([key, info, classValue, subIdx]);
+          expanded = true;
+        }
+      }
+
+      // 有 FieldInfo 但未成功展开：回退为普通报警
+      if (!expanded && !isNoValue(alarmText)) {
+        out.push([bit, cleanupText(stripPlaceholders(alarmText)) || alarmText, classValue, ""]);
+        stats.fallback++;
+      }
+    }
+
+    return { out, stats, errSheet: errPick.sheetName, subSheet: subPick.sheetName };
+  }
+
+  /* ---------- 输出与预览 ---------- */
+
+  function escapeHtml(value) {
+    return clean(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function renderPreview(result) {
+    const wrap = $("preview");
+    const rows = result.out.slice(0, 31);
+    let html = "<table><thead><tr><th>ErrorNoSubIndex</th><th>ErrorText</th><th>Class</th><th>SubIndex</th></tr></thead><tbody>";
+    for (let i = 1; i < rows.length; i++) {
+      html += "<tr><td>" + escapeHtml(rows[i][0]) + "</td><td>" + escapeHtml(rows[i][1]) + "</td><td>" + escapeHtml(rows[i][2]) + "</td><td>" + escapeHtml(rows[i][3]) + "</td></tr>";
+    }
+    wrap.innerHTML = html + "</tbody></table>";
+    wrap.style.display = "block";
+  }
+
+  async function run(download) {
+    if (!await ensureXlsx()) {
+      setStatus("未能加载 Excel 解析库（SheetJS）。本页依赖 CDN，内网电脑无法联网时请使用离线版。", "err");
+      return;
+    }
+    const alarmFile = $("alarmFile").files[0];
+    const textListFile = $("textListFile").files[0];
+    if (!alarmFile || !textListFile) {
+      setStatus("请同时上传报警表和文本列表两份 Excel。", "err");
+      return;
+    }
+    try {
+      setStatus("正在提取……");
+      const [errWb, subWb] = await Promise.all([
+        alarmFile.arrayBuffer().then(buf => XLSX.read(buf, { type: "array", cellDates: false })),
+        textListFile.arrayBuffer().then(buf => XLSX.read(buf, { type: "array", cellDates: false }))
+      ]);
+      const result = extract(errWb, subWb);
+      renderPreview(result);
+      const s = result.stats;
+      setStatus(
+        "提取完成。\n" +
+        "报警表工作表：" + result.errSheet + "；文本列表工作表：" + result.subSheet + "\n" +
+        "输出总行数：" + (result.out.length - 1) +
+        "（普通报警 " + s.plain + "；子索引展开 " + s.expanded +
+        "；子索引为0仅输出ID " + s.zero + "；回退 " + s.fallback + "；跳过空文本 " + s.skipped + "）" +
+        (download ? "\nExcel 已开始下载。" : "\n当前仅预览。"),
+        "ok"
+      );
+      if (download) {
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.aoa_to_sheet(result.out);
+        ws["!cols"] = [{ wch: 20 }, { wch: 92 }, { wch: 10 }, { wch: 10 }];
+        XLSX.utils.book_append_sheet(wb, ws, "提取结果");
+        const baseName = (alarmFile.name || "").replace(/\.xlsx?$/i, "");
+        const ts = new Date();
+        const pad = (n) => String(n).padStart(2, "0");
+        const stamp = ts.getFullYear() + pad(ts.getMonth() + 1) + pad(ts.getDate()) + "_" + pad(ts.getHours()) + pad(ts.getMinutes()) + pad(ts.getSeconds());
+        XLSX.writeFile(wb, baseName + "ErrorText_export_" + stamp + ".xlsx");
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("处理失败：" + (err && err.message ? err.message : err), "err");
+    }
+  }
+
+  $("runBtn").addEventListener("click", () => run(true));
+  $("previewBtn").addEventListener("click", () => run(false));
+})();
+</script>
+</body>
+</html>
